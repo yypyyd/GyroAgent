@@ -462,9 +462,19 @@ async function toutiaoPublish(page, payload) {
     const el = document.querySelector('.ProseMirror[contenteditable="true"]');
     if (el) { el.innerHTML = ''; el.dispatchEvent(new InputEvent('input', { bubbles: true })); }
   }).catch(() => {});
-  await page.click('loc=css:.ProseMirror').catch(() => {});
-  await page.keyboard.paste(payload.body);
-  await page.waitForTimeout(1500);
+  // 粘贴后必须验证正文真的进去了（空正文时「预览并发布」静默无效）
+  let bodyLen = 0;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await page.click('loc=css:.ProseMirror').catch(() => {});
+    await page.keyboard.paste(payload.body);
+    await page.waitForTimeout(1500);
+    bodyLen = await page.evaluate(() => {
+      const el = document.querySelector('.ProseMirror[contenteditable="true"]');
+      return el ? (el.innerText || '').trim().length : 0;
+    }).catch(() => 0);
+    if (bodyLen > 10) break;
+  }
+  if (bodyLen <= 10) return { ok: false, message: '正文粘贴失败（编辑器为空）', draft: true };
   await dismissModals(page);
   // 封面：选「单图」后上传第一张图（无图则「无封面」）
   if (payload.media?.length) {
@@ -490,15 +500,23 @@ async function toutiaoPublish(page, payload) {
   // 「预览并发布」→ 预览弹窗里再点发布
   const prev = await page.evaluate(clickExactText, { text: '预览并发布' });
   if (!prev) return { ok: false, message: '未找到「预览并发布」按钮', draft: true };
-  await page.waitForTimeout(2500);
-  await dismissModals(page, 2);
-  const fired = await page.evaluate(clickExactText, { text: '发布' })
-    || await page.evaluate(clickExactText, { text: '确定发布' })
-    || await page.evaluate(clickExactText, { text: '确认发布' });
+  // 预览弹窗可能延迟出现，轮询发布按钮（含「发表」「确认」「立即发布」等变体）
+  let fired = false;
+  for (let i = 0; i < 10 && !fired; i++) {
+    await page.waitForTimeout(1000);
+    await dismissModals(page, 1);
+    fired = await page.evaluate(clickExactText, { text: '发布' })
+      || await page.evaluate(clickExactText, { text: '确定发布' })
+      || await page.evaluate(clickExactText, { text: '确认发布' })
+      || await page.evaluate(clickExactText, { text: '立即发布' })
+      || await page.evaluate(clickExactText, { text: '发表' });
+  }
   if (!fired) return { ok: false, message: '预览弹窗中未找到发布按钮', draft: true };
   await page.waitForTimeout(5000);
+  // 成功后应离开编辑页：进入作品列表/详情页或出现成功文案；仍在 /graphic/publish 说明没发出去
   const url = await page.url().catch(() => '');
-  const ok = /group\/\d+|article|publish.*success|graphic/.test(url) || await page.evaluate(() => /发布成功|审核中|已提交/.test(document.body?.innerText || '')).catch(() => false);
+  const bodyHit = await page.evaluate(() => /发布成功|审核中|已提交|发表成功/.test(document.body?.innerText || '')).catch(() => false);
+  const ok = (!/graphic\/publish/.test(url) && /graphic\/articles|group\/\d+|profile_v4/.test(url)) || bodyHit;
   return { ok, url: ok ? url : undefined, message: ok ? '已提交发布' : '已点击发布，未确认结果，请在 Ego 中核对', draft: !ok };
 }
 
