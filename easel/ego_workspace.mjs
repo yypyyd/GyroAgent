@@ -502,9 +502,202 @@ async function toutiaoPublish(page, payload) {
   return { ok, url: ok ? url : undefined, message: ok ? '已提交发布' : '已点击发布，未确认结果，请在 Ego 中核对', draft: !ok };
 }
 
-const PUBLISH_DRIVERS = { juejin: juejinPublish, toutiao: toutiaoPublish };
+async function zhihuPublish(page, payload) {
+  // 知乎专栏编辑器：textarea 标题 + Draft.js 正文，点「发布」直达 /p/ 页面
+  await page.fill('loc=css:textarea[placeholder*="请输入标题"]', payload.title.slice(0, 100));
+  await page.evaluate(() => {
+    const el = document.querySelector('.public-DraftEditor-content');
+    if (el) { el.innerHTML = ''; el.dispatchEvent(new InputEvent('input', { bubbles: true })); }
+  }).catch(() => {});
+  await page.click('loc=css:.public-DraftEditor-content').catch(() => {});
+  await page.keyboard.paste(payload.body);
+  await page.waitForTimeout(2000);
+  await dismissModals(page);
+  const fired = await page.evaluate(clickExactText, { text: '发布' });
+  if (!fired) return { ok: false, message: '未找到「发布」按钮', draft: true };
+  for (let i = 0; i < 15; i++) {
+    await page.waitForTimeout(1000);
+    const st = await page.evaluate(() => ({
+      url: location.href,
+      err: (document.body.innerText.match(/发布失败|审核中|操作频繁|请填写|至少.{0,10}字/g) || [])[0] || "",
+    })).catch(() => null);
+    if (!st) continue;
+    if (/\/p\/\d+/.test(st.url)) return { ok: true, url: st.url, message: '已发布' };
+    if (/失败|频繁|请填写|至少/.test(st.err)) return { ok: false, message: `平台提示：${st.err}`, draft: true };
+  }
+  return { ok: false, message: '已点击发布，未确认跳转结果，请在 Ego 中核对', draft: true };
+}
+
+async function xhsPublish(page, payload) {
+  // 小红书图文笔记：必须至少 1 张图片；标题 ≤20 字，正文 ≤1000 字
+  const media = (payload.media || []).filter(m => /\.(png|jpe?g|webp)$/i.test(m));
+  if (!media.length) return { ok: false, message: '小红书发布需要至少一张图片', draft: false };
+  // 切到「上传图文」tab（真实点击，合成事件不触发 tab 切换）
+  const tabMarked = await page.evaluate(() => {
+    const t = [...document.querySelectorAll('.creator-tab')].find(e => (e.innerText || '').trim() === '上传图文');
+    if (t) { t.setAttribute('data-ego-xhs', 'tab'); return 1; }
+    return 0;
+  });
+  if (tabMarked) {
+    await page.click('loc=css:[data-ego-xhs="tab"]').catch(() => {});
+    await page.waitForTimeout(2000);
+  }
+  // 图片 file input（accept 含图片格式的那个）
+  await page.evaluate(() => {
+    const inp = [...document.querySelectorAll('input[type=file]')].find(e => /jpe?g|png|webp/i.test(e.accept || ''));
+    if (inp) inp.setAttribute('data-ego-xhs', 'img');
+  });
+  try {
+    await page.setInputFiles('loc=css:[data-ego-xhs="img"]', media.slice(0, 9));
+  } catch (e) {
+    return { ok: false, message: `图片上传失败：${String(e && e.message || e).slice(0, 120)}`, draft: false };
+  }
+  const edOk = await page.waitForSelector('loc=css:.tiptap.ProseMirror', { timeout: 25000 }).then(() => true).catch(() => false);
+  if (!edOk) return { ok: false, message: '图片上传后编辑器未出现', draft: true };
+  await page.fill('loc=css:input.d-text[placeholder*="填写标题"]', payload.title.slice(0, 20));
+  const tags = (payload.tags || []).slice(0, 5).map(t => '#' + String(t).replace(/^#+/, '')).join(' ');
+  const body = (payload.body + (tags ? ' ' + tags : '')).slice(0, 1000);
+  await page.click('loc=css:.tiptap.ProseMirror').catch(() => {});
+  await page.keyboard.paste(body);
+  await page.waitForTimeout(2000);
+  await dismissModals(page);
+  // 提交按钮是原生 <button>「发布」（侧栏「发布笔记」是 div，不能点）
+  const fired = await page.evaluate(() => {
+    const b = [...document.querySelectorAll('button')].find(e => e.getClientRects().length && (e.innerText || '').trim() === '发布');
+    if (b) { b.setAttribute('data-ego-xhs', 'pub'); return 1; }
+    return 0;
+  });
+  if (!fired) return { ok: false, message: '未找到「发布」按钮', draft: true };
+  await page.click('loc=css:[data-ego-xhs="pub"]').catch(() => {});
+  for (let i = 0; i < 15; i++) {
+    await page.waitForTimeout(1000);
+    const st = await page.evaluate(() => ({
+      url: location.href,
+      hit: (document.body.innerText.match(/发布成功|审核中|发布失败|内容违规|敏感|确定/g) || [])[0] || '',
+    })).catch(() => null);
+    if (!st) continue;
+    if (/\/publish\/success|发布成功/.test(st.url + ' ' + st.hit)) return { ok: true, url: st.url, message: '已发布' };
+    if (/失败|违规|敏感/.test(st.hit)) return { ok: false, message: `平台提示：${st.hit}`, draft: true };
+  }
+  return { ok: false, message: '已点击发布，未确认结果，请在 Ego 中核对', draft: true };
+}
+
+async function wechatOaPublish(page, payload) {
+  // 公众号图文：编辑器 URL 带动态 token，从后台首页链接里提取后直接打开
+  const cur = await page.url().catch(() => '');
+  if (!/appmsg/.test(cur)) {
+    await page.goto('https://mp.weixin.qq.com/', { timeout: 30000 });
+    await page.waitForTimeout(4000);
+    const token = await page.evaluate(() => {
+      const a = [...document.querySelectorAll('a[href*="token="]')].map(e => e.href).find(h => /token=\d+/.test(h));
+      const m = a && a.match(/token=(\d+)/);
+      return m ? m[1] : '';
+    });
+    if (!token) return { ok: false, message: '未获取到公众号 token，请先在 Ego 中登录并打开后台首页', draft: false };
+    await page.goto(`https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit_v2&action=edit&isNew=1&type=77&createType=0&token=${token}&lang=zh_CN`, { timeout: 30000 });
+    await page.waitForTimeout(5000);
+  }
+  // 1. 标题：定位 y 150-400 的矮 ProseMirror，focus 后粘贴（会同步 js_title）
+  const titleOk = await page.evaluate(() => {
+    const pm = [...document.querySelectorAll('.ProseMirror')].find(e => {
+      const b = e.getBoundingClientRect();
+      return b.height > 0 && b.height < 80 && b.y > 100 && b.y < 500;
+    });
+    if (!pm) return 0;
+    pm.setAttribute('data-ego-wx', 'title');
+    return 1;
+  });
+  if (!titleOk) return { ok: false, message: '未找到公众号标题编辑器', draft: true };
+  await page.click('loc=css:[data-ego-wx="title"]').catch(() => {});
+  await page.evaluate(() => {
+    const pm = document.querySelector('[data-ego-wx="title"]');
+    if (pm) pm.focus();
+  }).catch(() => {});
+  await page.keyboard.paste(payload.title.slice(0, 64));
+  await page.waitForTimeout(800);
+  // 2. 正文：含「从这里开始写正文」或最高的 ProseMirror
+  const bodySel = await page.evaluate(() => {
+    const pms = [...document.querySelectorAll('.ProseMirror')].filter(e => e.getClientRects().length);
+    const body = pms.find(e => (e.innerText || '').includes('从这里开始写正文')) ||
+      pms.sort((a, b) => b.getBoundingClientRect().height - a.getBoundingClientRect().height)[0];
+    if (body) body.setAttribute('data-ego-wx', 'body');
+    return body ? 1 : 0;
+  });
+  if (!bodySel) return { ok: false, message: '未找到公众号正文编辑器', draft: true };
+  await page.click('loc=css:[data-ego-wx="body"]').catch(() => {});
+  await page.keyboard.paste(payload.body.slice(0, 20000));
+  await page.waitForTimeout(1500);
+  // 3. 封面（群发必填）：图片 file input
+  if (payload.media?.length) {
+    try {
+      await page.evaluate(() => {
+        const inp = [...document.querySelectorAll('input[type=file]')].find(e => /image/i.test(e.accept || ''));
+        if (inp) inp.setAttribute('data-ego-wx', 'cover');
+      });
+      await page.setInputFiles('loc=css:[data-ego-wx="cover"]', payload.media.slice(0, 1)).catch(() => {});
+      await page.waitForTimeout(3000);
+    } catch { /* 封面失败仍尝试 */ }
+  }
+  // 4. 正文插入一张图（公众号要求正文含图）：光标移到正文末尾 → 图片按钮 → file input
+  if (payload.media?.length) {
+    try {
+      await page.evaluate(() => {
+        const body = document.querySelector('[data-ego-wx="body"]');
+        if (body) { body.focus(); const s = getSelection(); s.selectAllChildren(body); s.collapseToEnd(); }
+      });
+      await page.evaluate(() => {
+        const b = [...document.querySelectorAll('button,div,span,a')].find(e => e.getClientRects().length && (e.innerText || '').trim() === '图片' && e.children.length < 4);
+        if (b) b.setAttribute('data-ego-wx', 'imgbtn');
+      });
+      await page.click('loc=css:[data-ego-wx="imgbtn"]').catch(() => {});
+      await page.waitForTimeout(1200);
+      await page.setInputFiles('loc=css:input[type=file]', payload.media.slice(1, 2).length ? payload.media.slice(1, 2) : payload.media.slice(0, 1)).catch(() => {});
+      await page.waitForTimeout(4000);
+    } catch { /* 内嵌图失败仍尝试 */ }
+  }
+  await dismissModals(page);
+  // 5. 点「发表」→ 可能的确认弹窗 → 群发
+  const fired = await page.evaluate(() => {
+    const b = [...document.querySelectorAll('button')].find(e => e.getClientRects().length && (e.innerText || '').trim() === '发表');
+    if (b) { b.setAttribute('data-ego-wx', 'pub'); return 1; }
+    return 0;
+  });
+  if (!fired) return { ok: false, message: '未找到「发表」按钮', draft: true };
+  await page.click('loc=css:[data-ego-wx="pub"]').catch(() => {});
+  await page.waitForTimeout(2500);
+  // 发表后可能有确认弹窗（群发/预览），再点确定/群发
+  for (let i = 0; i < 12; i++) {
+    await page.waitForTimeout(1000);
+    const st = await page.evaluate(() => ({
+      url: location.href,
+      hit: (document.body.innerText.match(/群发成功|发表成功|发送成功|审核中|发表失败|群发|确定|确认/g) || [])[0] || '',
+      dlg: [...document.querySelectorAll('[class*=dialog],[class*=modal],[class*=Dialog],[class*=layer]')]
+        .filter(e => e.getClientRects().length && (e.innerText || '').trim() && (e.innerText || '').trim().length < 300)
+        .map(e => (e.innerText || '').replace(/\n/g, '|').slice(0, 80))[0] || '',
+    })).catch(() => null);
+    if (!st) continue;
+    if (/群发成功|发表成功|发送成功|appmsgpublish|publish.*success/.test(st.url + ' ' + st.hit)) {
+      return { ok: true, url: st.url, message: '已群发' };
+    }
+    if (/失败|错误/.test(st.hit)) return { ok: false, message: `平台提示：${st.hit}`, draft: true };
+    // 有确认弹窗时点「确定/群发」
+    if (st.dlg && /群发|确定|确认|发表/.test(st.dlg)) {
+      const conf = await page.evaluate(() => {
+        const btns = [...document.querySelectorAll('button,[class*=btn],div,span')]
+          .filter(e => e.getClientRects().length && /^(群发|确定|确认|发表)$/.test((e.innerText || '').trim()));
+        const b = btns[btns.length - 1];
+        if (b) { b.setAttribute('data-ego-wx', 'cfm'); return 1; }
+        return 0;
+      });
+      if (conf) await page.click('loc=css:[data-ego-wx="cfm"]').catch(() => {});
+    }
+  }
+  return { ok: false, message: '已点击发表，未确认群发结果，请在 Ego 中核对', draft: true };
+}
+
+const PUBLISH_DRIVERS = { juejin: juejinPublish, toutiao: toutiaoPublish, zhihu: zhihuPublish, xiaohongshu: xhsPublish, 'wechat-oa': wechatOaPublish };
 // 已在「可发布的编辑页」的 URL 判定；不匹配则重新打开目标编辑器
-const READY_PATH = { juejin: /\/editor\//, toutiao: /\/publish|graphic\/publish/ };
+const READY_PATH = { juejin: /\/editor\//, toutiao: /\/publish|graphic\/publish/, zhihu: /\/write/, xiaohongshu: /\/publish\/publish/, 'wechat-oa': /appmsg/ };
 
 export async function publish({ platform, urls, spaceId, spaceName, payload }) {
   const hosts = hostsOf(urls);

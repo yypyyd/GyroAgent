@@ -64,7 +64,7 @@ class AutoPublish(Platform):
 
 
 # 允许 Ego 全自动发布的平台（driver 在 ego_workspace.mjs 的 PUBLISH_DRIVERS 中）
-AUTO_PUBLISH_PLATFORMS = {"juejin", "toutiao"}
+AUTO_PUBLISH_PLATFORMS = {"juejin", "toutiao", "zhihu", "xiaohongshu", "wechat-oa"}
 _OUTPUTS = _SCRIPT.parents[1] / "outputs"
 
 

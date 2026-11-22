@@ -13,7 +13,7 @@ const LEGACY_PUBLISH_URL: Record<string, string> = {
   'twitter-x': 'https://x.com/compose/post', bilibili: 'https://member.bilibili.com/', 'wechat-oa': 'https://mp.weixin.qq.com/',
 };
 
-const EGO_AUTO_PUBLISH = new Set(['juejin', 'toutiao']);
+const EGO_AUTO_PUBLISH = new Set(['juejin', 'toutiao', 'zhihu', 'xiaohongshu', 'wechat-oa']);
 
 const PLATFORMS = [
   { key: 'xiaohongshu', label: '小红书', titleLimit: 20, bodyLimit: 1000, hint: '在官方创作平台选择图文或视频，核对封面与话题。' },
