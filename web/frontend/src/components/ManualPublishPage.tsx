@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { createSchedule, executeSkill, exportManualPackage, fetchOutputs, fillEgoField, mediaUrl, openEgoPage, runAgent, streamChat } from '../lib/api';
+import { createSchedule, executeSkill, exportManualPackage, fetchOutputs, fillEgoField, mediaUrl, openEgoPage, publishEgoAuto, runAgent, streamChat } from '../lib/api';
 import type { OutputFile } from '../lib/api';
 import { loadPublishDraft, savePublishDraft } from '../lib/store';
 import { renderMarkdown } from '../lib/sanitize';
@@ -12,6 +12,8 @@ const LEGACY_PUBLISH_URL: Record<string, string> = {
   juejin: 'https://juejin.cn/editor/drafts/new?v=2', toutiao: 'https://mp.toutiao.com/profile_v4/graphic/publish',
   'twitter-x': 'https://x.com/compose/post', bilibili: 'https://member.bilibili.com/', 'wechat-oa': 'https://mp.weixin.qq.com/',
 };
+
+const EGO_AUTO_PUBLISH = new Set(['juejin', 'toutiao']);
 
 const PLATFORMS = [
   { key: 'xiaohongshu', label: '小红书', titleLimit: 20, bodyLimit: 1000, hint: '在官方创作平台选择图文或视频，核对封面与话题。' },
@@ -170,6 +172,22 @@ export default function ManualPublishPage({ persona, egoEnabled }: { persona: st
     } finally { setOpening(''); }
   };
 
+  const publishAuto = async (key: string) => {
+    if (!egoEnabled || !approved(key) || opening || !EGO_AUTO_PUBLISH.has(key)) return;
+    setOpening(`${key}:auto`);
+    setOpenResult(null);
+    try {
+      const tagList = tags.split(/[,，]/).map((t) => t.trim().replace(/^#+/, '')).filter(Boolean);
+      const result = await publishEgoAuto(key, {
+        title: title.trim(), body: bodyWithTags(key), tags: tagList, media: [...selectedMedia], reviewed: true,
+      });
+      if (result.url) setLinks((old) => ({ ...old, [key]: result.url! }));
+      setOpenResult({ key, message: result.ok ? `${result.message}；请在官方页面核对结果。` : `${result.message}（内容可能已存为草稿）`, failed: !result.ok });
+    } catch (error) {
+      setOpenResult({ key, message: `自动发布失败：${error instanceof Error ? error.message : '请检查 Ego 后重试'}`, failed: true });
+    } finally { setOpening(''); }
+  };
+
   const copyRichText = async () => {
     if (!approved('wechat-oa')) return;
     try {
@@ -268,6 +286,7 @@ export default function ManualPublishPage({ persona, egoEnabled }: { persona: st
               {egoEnabled ? <>
                 <button className="btn btn-sm btn-primary" disabled={!ready || !!opening} onClick={() => openOfficialPage(p.key)}>{opening === `${p.key}:open` ? 'Ego 正在打开…' : ready ? '用 Ego 打开官方发布页' : '审核后用 Ego 打开官方发布页'}</button>
                 {(['title', 'body'] as const).map((part) => <button key={part} className="btn btn-sm" disabled={!ready || !!opening || !(part === 'title' ? title : bodyWithTags(p.key)).trim()} onClick={() => fillField(p.key, part)}>{opening === `${p.key}:${part}` ? '正在填入…' : part === 'title' ? '填标题到 Ego' : '填正文到 Ego'}</button>)}
+                {EGO_AUTO_PUBLISH.has(p.key) && <button className="btn btn-sm btn-primary" disabled={!ready || !!opening || !title.trim()} onClick={() => publishAuto(p.key)}>{opening === `${p.key}:auto` ? 'Ego 发布中…' : 'Ego 自动发布'}</button>}
               </> : ready ? <a className="btn btn-sm btn-primary" href={LEGACY_PUBLISH_URL[p.key]} target="_blank" rel="noopener noreferrer">打开官方发布页 ↗</a> : <button className="btn btn-sm" disabled>审核后打开官方发布页</button>}
             </div>
             {egoEnabled && <p className="pv-hint">先在 Ego 官方发布页点选空白标题或正文编辑框，再回到此处填入对应内容。不会覆盖已有文字，正文包含话题标签。</p>}

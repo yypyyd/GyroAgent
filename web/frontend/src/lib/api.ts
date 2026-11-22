@@ -716,6 +716,26 @@ export async function fillEgoField(platform: string, text: string): Promise<stri
   return result.message;
 }
 
+export interface EgoPublishResult {
+  ok: boolean;
+  message: string;
+  url?: string;
+  draft?: boolean;
+}
+
+/** Ego 全自动发布：仅支持已在后端登记 driver 的平台，需 reviewed=true。 */
+export async function publishEgoAuto(platform: string, payload: {
+  title: string; body: string; tags: string[]; media: string[]; category?: string; reviewed: boolean;
+}): Promise<EgoPublishResult> {
+  const result = await request<EgoPublishResult>('/api/ego/publish', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platform, ...payload }),
+  });
+  if (!result || typeof result.ok !== 'boolean' || typeof result.message !== 'string') {
+    throw new Error('Ego 未返回可识别的发布结果，请在官方页面核对');
+  }
+  return result;
+}
+
 /** Create a local export only; no social platform is contacted. */
 export function exportManualPackage(platform: string, payload: {
   title: string; body: string; tags: string; media: string[]; reviewed: boolean;

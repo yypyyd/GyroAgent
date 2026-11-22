@@ -54,6 +54,36 @@ class Fill(Platform):
     reviewed: StrictBool
 
 
+class AutoPublish(Platform):
+    title: str = Field(default="", max_length=200)
+    body: str = Field(default="", max_length=50000)
+    tags: list[str] = Field(default_factory=list, max_length=10)
+    media: list[str] = Field(default_factory=list, max_length=10)
+    category: str = Field(default="", max_length=30)
+    reviewed: StrictBool
+
+
+# 允许 Ego 全自动发布的平台（driver 在 ego_workspace.mjs 的 PUBLISH_DRIVERS 中）
+AUTO_PUBLISH_PLATFORMS = {"juejin", "toutiao"}
+_OUTPUTS = _SCRIPT.parents[1] / "outputs"
+
+
+def _resolve_media(media: list[str]) -> list[str]:
+    from easel.manual_publish import MEDIA_EXTENSIONS
+    root = _OUTPUTS.resolve()
+    files = []
+    for relative in dict.fromkeys(media):
+        path = (root / relative).resolve()
+        if root not in path.parents:
+            raise HTTPException(400, "媒体路径超出内容库")
+        if any(part.startswith(("_", ".")) for part in path.relative_to(root).parts):
+            raise HTTPException(400, "不能发布系统目录或隐藏文件")
+        if not path.is_file() or path.suffix.lower() not in MEDIA_EXTENSIONS:
+            raise HTTPException(400, "只能发布内容库中的图片或视频")
+        files.append(path)
+    return [str(p).replace("\\", "/") for p in files[:3]]
+
+
 def enabled():
     return read_settings().get("EASEL_BROWSER_BACKEND", "").strip().lower() == "ego"
 
@@ -212,3 +242,43 @@ def fill(body: Fill, request: Request):
     if not body.reviewed or not body.text.strip():
         raise HTTPException(400, "请先审核非空稿件，再填入官方编辑框")
     return _bridge(request, body.platform, "fill", text=body.text)
+
+
+@router.post("/publish")
+def auto_publish(body: AutoPublish, request: Request):
+    if not body.reviewed:
+        raise HTTPException(400, "请先完成人工审核再自动发布")
+    if not (body.title.strip() or body.body.strip()):
+        raise HTTPException(400, "标题和正文不能同时为空")
+    if body.platform not in AUTO_PUBLISH_PLATFORMS:
+        raise HTTPException(400, f"{body.platform} 暂不支持 Ego 自动发布")
+    exe = _guard(request)
+    if not _lock.acquire(blocking=False):
+        raise HTTPException(409, "上一次 Ego 操作尚未结束，请稍候")
+    try:
+        state = _read_state()
+        workspace = _workspace(state)
+        if "_workspace" not in state:
+            state["_workspace"] = workspace
+            _save_state(state)
+        media = _resolve_media(body.media)
+        options = dict(platform=body.platform, action="publish", urls=PLATFORMS[body.platform],
+                       spaceName=workspace["name"], spaceId=workspace.get("id"),
+                       payload={"title": body.title, "body": body.body,
+                                "tags": [t.strip() for t in body.tags if t.strip()][:10],
+                                "media": media, "category": body.category.strip()})
+        result = _invoke(exe, "publish", options, 240)
+        if isinstance(result, dict) and result.get("spaceId") is not None:
+            sid = result.pop("spaceId")
+            if type(sid) is int and sid != workspace.get("id"):
+                workspace["id"] = sid
+                _save_state(state)
+        return result
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Ego 自动发布超时，请查看官方页面确认是否已提交") from None
+    except HTTPException:
+        raise
+    except (OSError, ValueError, TypeError, KeyError):
+        raise HTTPException(503, "无法启动 Ego 或读取其结果，请检查本机 Ego。") from None
+    finally:
+        _lock.release()

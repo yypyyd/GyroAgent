@@ -27,11 +27,26 @@ class DirectAPIError(Exception):
     """Safe user-facing diagnostics; never include credentials or upstream bodies."""
 
 
+def _read_text_tolerant(path: Path) -> str:
+    """读取用户可编辑的配置文件，单个坏字节不至于让整个接口 500。
+
+    Windows 上 .env 常被记事本/PowerShell 以 GBK 或混合编码保存，
+    中文注释里一个残缺字节就会抛 UnicodeDecodeError（曾导致 /api/ego/status 崩）。
+    """
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def read_settings(env_file: Path | None = None) -> dict[str, str]:
     settings = {}
     path = env_file if env_file is not None else PROJECT_ROOT / ".env"
     if path.is_file():
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in _read_text_tolerant(path).splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)

@@ -262,6 +262,295 @@ async function closeLegacy(spaces, keepId) {
 // Login state of every platform, read in the background with the browser's existing
 // sessions. Platforms without a tab are checked in one temporary tab that is closed
 // afterwards; nothing is foregrounded and the window is not flagged for attention.
+// ── 自动发布（Ego 全自动）────────────────────────────────────────
+// 仅在用户已在前端完成人工审核（reviewed）后由本地后端调用。
+// 每个平台一个 driver：打开官方发布页 → 填标题/正文/标签/封面 → 点击发布 → 回执。
+// 任何一步失败都不补点重试，草稿保留在平台草稿箱，由用户在 Ego 中处理。
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// 点击页面上 innerText 精确等于 text 的最内层可见元素（button/a/[role=button]/li/span/div）。
+// evaluate 内直接 el.click()：派发真实 click 事件，React 合成事件可正常触发。
+export function clickExactText({ text, attr = 'data-ego-click' }) {
+  const clean = s => String(s || '').replace(/\s+/g, ' ').trim();
+  const want = clean(text);
+  if (!want) return 0;
+  const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], li, span, div, label'))
+    .filter(el => el.getClientRects().length && !el.closest('[aria-hidden="true"], [inert]'));
+  // 最内层：没有子元素也精确匹配，或自身 innerText 精确匹配且不可再分
+  const leaf = candidates.filter(el => clean(el.innerText) === want)
+    .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
+  const el = leaf.find(e => !el_has_clickable_child(e)) || leaf[0];
+  function el_has_clickable_child(node) {
+    return Array.from(node.children).some(c => clean(c.innerText) === want);
+  }
+  if (!el) return 0;
+  el.setAttribute(attr, '1');
+  el.click();
+  return 1;
+}
+
+// 关闭遮挡表单的弹窗：点已知的确认/关闭类按钮，最多 round 轮。
+async function dismissModals(page, rounds = 3) {
+  const DISMISS = /知道了|我知道了|已知悉|关闭|取消|暂不|以后再|不再提示|跳过|确定|我知道了|got it|close/i;
+  for (let i = 0; i < rounds; i++) {
+    const hit = await page.evaluate(({ re }) => {
+      const rx = new RegExp(re, 'i');
+      const els = Array.from(document.querySelectorAll('[class*=modal] button, [class*=Modal] button, [class*=dialog] button, [role=dialog] button, [class*=modal] [class*=close], [class*=Modal] [class*=close]'))
+        .filter(e => e.getClientRects().length);
+      const el = els.find(e => rx.test((e.innerText || e.getAttribute('aria-label') || '').trim()) || /close|关闭/i.test(e.className || ''));
+      if (!el) return 0;
+      el.click();
+      return 1;
+    }, { re: DISMISS.source });
+    if (!hit) return;
+    await page.waitForTimeout(700);
+  }
+}
+
+async function juejinPublish(page, payload) {
+  const titleSel = 'loc=css:input[placeholder*="输入文章标题"]';
+  await page.fill(titleSel, payload.title.slice(0, 100));
+  // 正文是 CodeMirror：先清空（复用草稿页时避免追加），聚焦后用系统粘贴写入 Markdown
+  await page.evaluate(() => {
+    const cm = document.querySelector('.CodeMirror');
+    if (cm && cm.CodeMirror) cm.CodeMirror.setValue('');
+  }).catch(() => {});
+  await page.click('loc=css:.CodeMirror-code, .cm-content').catch(() => {});
+  await page.keyboard.paste(payload.body);
+  await page.waitForTimeout(2000);
+  await dismissModals(page);
+  // 点顶栏「发布」打开发布设置弹窗
+  const opened = await page.evaluate(clickExactText, { text: '发布' });
+  if (!opened) return { ok: false, message: '未找到发布按钮' };
+  const hasDialog = await page.waitForSelector('text="确定并发布"', { timeout: 8000 }).then(() => true).catch(() => false);
+  if (!hasDialog) return { ok: false, message: '发布设置弹窗未出现，可能有必填项未完成', draft: true };
+  // 分类（必填）：payload.category 优先，否则点第一个选项
+  const category = payload.category || '前端';
+  const catOk = await page.evaluate(clickExactText, { text: category });
+  if (!catOk) {
+    // 回退：点分类区第一个选项文本
+    await page.evaluate(() => {
+      const texts = ['后端', '前端', 'Android', 'iOS', '人工智能', '开发工具', '代码人生', '阅读'];
+      for (const t of texts) {
+        const el = Array.from(document.querySelectorAll('div,span,li')).find(e => e.getClientRects().length && (e.innerText || '').trim() === t);
+        if (el) { el.click(); return t; }
+      }
+      return null;
+    });
+  }
+  await page.waitForTimeout(400);
+  // 标签（必填，最多 3 个）：byte-select 下拉，优先点预设选项，否则搜索
+  const tags = (payload.tags || []).slice(0, 3);
+  if (!tags.length) return { ok: false, message: '缺少标签（掘金发布必填）', draft: true };
+  for (const tag of tags) {
+    try {
+      // 标记该标签行的 select 与 input
+      await page.evaluate(() => {
+        document.querySelectorAll("[data-ego-tag]").forEach(e => e.removeAttribute("data-ego-tag"));
+        const pop = document.querySelector(".publish-popup.active") || document.querySelector(".publish-popup");
+        const lab = [...pop.querySelectorAll(".label")].find(e => (e.innerText || "").includes("添加标签"));
+        const item = lab && lab.closest(".form-item");
+        const sel = item && item.querySelector(".byte-select");
+        const inp = item && item.querySelector(".byte-select__input");
+        if (sel) sel.setAttribute("data-ego-tag", "sel");
+        if (inp) inp.setAttribute("data-ego-tag", "inp");
+      });
+      await page.click('loc=css:[data-ego-tag="sel"]').catch(() => {});
+      await page.waitForTimeout(700);
+      // 优先点与标签同名的预设选项（li.byte-select-option）
+      let picked = await page.evaluate(({ t }) => {
+        const opt = [...document.querySelectorAll("li.byte-select-option, .byte-select-option")]
+          .find(e => e.getClientRects().length && (e.innerText || "").trim() === t);
+        if (!opt) return 0;
+        opt.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        opt.click();
+        return 1;
+      }, { t: tag });
+      if (!picked) {
+        // 无同名预设：输入搜索词后点第一个建议
+        await page.fill('loc=css:[data-ego-tag="inp"]', tag).catch(() => {});
+        await page.waitForTimeout(1000);
+        await page.evaluate(() => {
+          const opt = [...document.querySelectorAll("li.byte-select-option, .byte-select-option, .byte-select-dropdown li")]
+            .find(e => e.getClientRects().length && (e.innerText || "").trim().length > 0 && (e.innerText || "").trim().length < 30);
+          if (opt) { opt.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); opt.click(); }
+        });
+      }
+      await page.waitForTimeout(400);
+    } catch { /* 单个标签失败不阻塞 */ }
+  }
+  // 校验标签确实已加入（仍显示占位符说明没选上）
+  const tagAdded = await page.evaluate(() => {
+    const pop = document.querySelector(".publish-popup.active") || document.querySelector(".publish-popup");
+    const lab = [...pop.querySelectorAll(".label")].find(e => (e.innerText || "").includes("添加标签"));
+    const item = lab && lab.closest(".form-item");
+    return !!(item && !/请搜索添加标签/.test(item.innerText || ""));
+  }).catch(() => false);
+  if (!tagAdded) return { ok: false, message: '标签未能添加成功（掘金必填）', draft: true };
+  // 摘要（必填，掘金要求 50-100 字）：优先 payload.abstract，否则从正文提取
+  const plain = String(payload.body || "").replace(/[#>*`\-\[\]()!_|]/g, " ").replace(/\s+/g, " ").trim();
+  let abstract = String(payload.abstract || "").trim() || (payload.title + " " + plain).replace(/\s+/g, " ").trim();
+  abstract = abstract.slice(0, 100);
+  if (abstract.length < 50) {
+    // 用正文补足到 50 字
+    abstract = (abstract + " " + plain).replace(/\s+/g, " ").trim().slice(0, 100);
+  }
+  if (abstract.length < 50) return { ok: false, message: '摘要不足 50 字（掘金必填）', draft: true };
+  try {
+    await page.evaluate(() => {
+      const pop = document.querySelector(".publish-popup.active") || document.querySelector(".publish-popup");
+      const lab = [...pop.querySelectorAll(".label")].find(e => (e.innerText || "").includes("编辑摘要"));
+      const ta = lab && lab.closest(".form-item") && lab.closest(".form-item").querySelector("textarea");
+      if (ta) ta.setAttribute("data-ego-tag", "abs");
+    });
+    await page.fill('loc=css:[data-ego-tag="abs"]', abstract).catch(() => {});
+    await page.evaluate(() => {
+      const ta = document.querySelector('[data-ego-tag="abs"]');
+      if (ta) { ta.dispatchEvent(new Event('input', { bubbles: true })); ta.dispatchEvent(new Event('change', { bubbles: true })); ta.blur(); }
+    }).catch(() => {});
+    await page.waitForTimeout(500);
+  } catch { /* 摘要失败仍尝试发布 */ }
+  // 封面（可选）：取第一张图片
+  if (payload.media?.length) {
+    try {
+      const chooserPromise = page.waitForFileChooser({ timeout: 5000 }).catch(() => null);
+      await page.evaluate(clickExactText, { text: '上传封面' });
+      const chooser = await chooserPromise;
+      if (chooser) await chooser.setFiles(payload.media[0]);
+      else await page.setInputFiles('loc=css:input[type=file]', [payload.media[0]]).catch(() => {});
+      await page.waitForTimeout(1500);
+      // 可能的裁剪/确认弹窗
+      await page.evaluate(clickExactText, { text: '确定' }).catch(() => {});
+      await page.evaluate(clickExactText, { text: '完成' }).catch(() => {});
+      await page.waitForTimeout(800);
+    } catch { /* 封面失败仍可发布 */ }
+  }
+  // 确定并发布：轮询 URL/弹窗状态/平台报错；5 秒无进展时补点一次（防点击落空）
+  let fired = await page.evaluate(clickExactText, { text: '确定并发布' });
+  if (!fired) return { ok: false, message: '未找到「确定并发布」按钮', draft: true };
+  for (let i = 0; i < 20; i++) {
+    await page.waitForTimeout(1000);
+    if (i === 5) {
+      fired = await page.evaluate(clickExactText, { text: '确定并发布' }).catch(() => 0);
+    }
+    const st = await page.evaluate(() => ({
+      url: location.href,
+      popOpen: !!document.querySelector(".publish-popup.active"),
+      err: (document.body.innerText.match(/摘要不满足|请填写|请选择|发布失败|操作频繁|审核中|发布成功|已发布|至少.{0,10}字/g) || [])[0] || "",
+    })).catch(() => null);
+    if (!st) continue;
+    if (/\/post\/\d+|\/article\/\d+|\/published|发布成功/.test(st.url + " " + st.err)) {
+      return { ok: true, url: st.url, message: '已发布' };
+    }
+    if (/失败|频繁|不满足|请填写|请选择|至少/.test(st.err)) return { ok: false, message: `平台提示：${st.err}`, draft: true };
+    if (!st.popOpen) {
+      const done = await page.evaluate(() => /发布成功|审核中|已提交|已发布/.test(document.body?.innerText || "")).catch(() => false);
+      return done
+        ? { ok: true, url: st.url, message: '已提交发布' }
+        : { ok: false, message: '弹窗已关闭但未确认发布结果，请在 Ego 中核对', draft: true };
+    }
+  }
+  return { ok: false, message: '已点击发布，未确认跳转结果，请在 Ego 中核对', draft: true };
+}
+
+async function toutiaoPublish(page, payload) {
+  await dismissModals(page, 4);
+  await page.fill('loc=css:textarea[placeholder*="请输入文章标题"]', payload.title.slice(0, 30));
+  // 复用发布页时先清空正文，避免追加
+  await page.evaluate(() => {
+    const el = document.querySelector('.ProseMirror[contenteditable="true"]');
+    if (el) { el.innerHTML = ''; el.dispatchEvent(new InputEvent('input', { bubbles: true })); }
+  }).catch(() => {});
+  await page.click('loc=css:.ProseMirror').catch(() => {});
+  await page.keyboard.paste(payload.body);
+  await page.waitForTimeout(1500);
+  await dismissModals(page);
+  // 封面：选「单图」后上传第一张图（无图则「无封面」）
+  if (payload.media?.length) {
+    try {
+      await page.evaluate(clickExactText, { text: '单图' });
+      await page.waitForTimeout(1200);
+      const chooserPromise = page.waitForFileChooser({ timeout: 5000 }).catch(() => null);
+      // 上传区通常是图片占位按钮/文字
+      await page.evaluate(() => {
+        const els = Array.from(document.querySelectorAll('div,span,button,label'))
+          .filter(e => e.getClientRects().length && /上传|添加|选择/.test(e.innerText || '') && (e.innerText || '').length < 20);
+        els.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)[0]?.click();
+      });
+      const chooser = await chooserPromise;
+      if (chooser) await chooser.setFiles(payload.media[0]);
+      else await page.setInputFiles('loc=css:input[type=file]', [payload.media[0]]).catch(() => {});
+      await page.waitForTimeout(1500);
+    } catch { /* 封面失败仍可发布 */ }
+  } else {
+    await page.evaluate(clickExactText, { text: '无封面' }).catch(() => {});
+  }
+  await dismissModals(page);
+  // 「预览并发布」→ 预览弹窗里再点发布
+  const prev = await page.evaluate(clickExactText, { text: '预览并发布' });
+  if (!prev) return { ok: false, message: '未找到「预览并发布」按钮', draft: true };
+  await page.waitForTimeout(2500);
+  await dismissModals(page, 2);
+  const fired = await page.evaluate(clickExactText, { text: '发布' })
+    || await page.evaluate(clickExactText, { text: '确定发布' })
+    || await page.evaluate(clickExactText, { text: '确认发布' });
+  if (!fired) return { ok: false, message: '预览弹窗中未找到发布按钮', draft: true };
+  await page.waitForTimeout(5000);
+  const url = await page.url().catch(() => '');
+  const ok = /group\/\d+|article|publish.*success|graphic/.test(url) || await page.evaluate(() => /发布成功|审核中|已提交/.test(document.body?.innerText || '')).catch(() => false);
+  return { ok, url: ok ? url : undefined, message: ok ? '已提交发布' : '已点击发布，未确认结果，请在 Ego 中核对', draft: !ok };
+}
+
+const PUBLISH_DRIVERS = { juejin: juejinPublish, toutiao: toutiaoPublish };
+// 已在「可发布的编辑页」的 URL 判定；不匹配则重新打开目标编辑器
+const READY_PATH = { juejin: /\/editor\//, toutiao: /\/publish|graphic\/publish/ };
+
+export async function publish({ platform, urls, spaceId, spaceName, payload }) {
+  const hosts = hostsOf(urls);
+  const onHost = url => onHosts(url, hosts);
+  const target = urls[1] || urls[0];
+  if (!PUBLISH_DRIVERS[platform]) return failure(`平台 ${platform} 暂不支持 Ego 自动发布`);
+  if (!payload?.title?.trim() && !payload?.body?.trim()) return failure('标题和正文不能为空');
+  const spaces = await listTaskSpaces();
+  const entry = ownSpace(spaces, spaceId, spaceName);
+  const task = await acquire(entry, spaceName);
+  let result, needsUser = true;
+  try {
+    const pages = await task.pages();
+    const tabs = await task.tabs();
+    let tab = tabs.find(item => item.active);
+    if (!(tab?.label && onHost(tab.url))) tab = tabs.find(item => item.label && onHost(item.url)) ?? tab;
+    let page = tab ? pages.find(p => p.label === tab.label) : pages[0];
+    if (!page && !entry) page = task.page('p1');
+    if (!page) page = await task.newPage();
+    const current = await page.url();
+    const readyRe = READY_PATH[platform];
+    const ready = onHost(current) && (!readyRe || readyRe.test(current));
+    if (!ready) {
+      if (!onHost(current) && !BLANK.test(current)) page = await task.newPage();
+      await page.goto(target, {timeout: 30000});
+    }
+    const {state} = await judge(page, hosts, platform);
+    if (state === 'login_required' || state === 'restricted') {
+      await page.cdp('Page.bringToFront', {}, {timeout:3000}).catch(() => {});
+      return {...failure(state === 'restricted' ? '平台要求验证，请在 Ego 中人工处理' : '请先在 Ego 中登录该平台'), spaceId: task.spaceId};
+    }
+    result = await PUBLISH_DRIVERS[platform](page, payload);
+    needsUser = !result?.ok;
+    if (result?.ok) {
+      try { await page.cdp('Page.bringToFront', {}, {timeout:3000}); } catch {}
+      result = {...result, spaceId: task.spaceId};
+    }
+  } catch (e) {
+    needsUser = true;
+    result = failure(`Ego 自动发布未完成（${String(e && e.message || e).slice(0, 160)}），内容可能已存为草稿。`);
+  } finally {
+    await release(task, needsUser);
+  }
+  return {...(result || failure('发布失败')), spaceId: task.spaceId ?? result?.spaceId};
+}
+
 export async function status({ spaceName, spaceId, platforms }) {
   const spaces = await listTaskSpaces();
   const entry = ownSpace(spaces, spaceId, spaceName);

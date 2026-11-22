@@ -561,6 +561,23 @@ for _spec in SKILL_API_REQUIREMENTS.values():
             _ENV_ALLOWLIST.update(_key.get("aliases", []))
 
 ENV_FILE = PROJECT_ROOT / ".env"
+
+
+def _read_env_text() -> str:
+    """容忍编码损坏地读 .env：utf-8 → gbk → 替换坏字节。
+
+    用户在 Windows 记事本/编辑器里改过 .env 后，中文注释里常见残缺字节，
+    严格 utf-8 会抛 UnicodeDecodeError 把设置接口和状态接口一起打成 500。
+    """
+    raw = ENV_FILE.read_bytes()
+    for encoding in ("utf-8-sig", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 _HARNESS_LOOP = None
 _PLACEHOLDER_RE = re.compile(r"replace_me|your[-_]?api[-_]?key|xxx|^\.{3}$|^<.*>$", re.I)
 
@@ -861,7 +878,7 @@ def _read_env() -> dict[str, str]:
     result = {}
     if not ENV_FILE.is_file():
         return result
-    for line in ENV_FILE.read_text(encoding='utf-8').splitlines():
+    for line in _read_env_text().splitlines():
         s = line.strip()
         if not s or s.startswith('#') or '=' not in s:
             continue
@@ -1058,7 +1075,7 @@ def _write_env(updates: dict[str, str]) -> None:
     _guard_env_values(updates)
     if not updates:
         return
-    lines = ENV_FILE.read_text(encoding='utf-8').splitlines() if ENV_FILE.is_file() else []
+    lines = _read_env_text().splitlines() if ENV_FILE.is_file() else []
     seen = set()
     out = []
     for line in lines:
@@ -2146,7 +2163,7 @@ def _write_env_direct(updates: dict[str, str]) -> None:
     if not updates:
         return
     _guard_env_values(updates)
-    lines = ENV_FILE.read_text(encoding='utf-8').splitlines() if ENV_FILE.is_file() else []
+    lines = _read_env_text().splitlines() if ENV_FILE.is_file() else []
     seen = set()
     out = []
     for line in lines:
